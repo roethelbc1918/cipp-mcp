@@ -52,8 +52,6 @@ ENV MCP_HTTP_PORT=8080
 ENV MCP_HTTP_HOST=0.0.0.0
 ENV AUTH_MODE=env
 
-VOLUME ["/app/logs"]
-
 CMD ["node", "dist/index.js"]
 
 LABEL maintainer="engineering@wyre.ai"
