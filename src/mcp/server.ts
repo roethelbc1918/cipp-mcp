@@ -17,6 +17,10 @@ import { EnvironmentConfig, parseCredentialsFromHeaders } from '../utils/config.
 import { CippToolHandler } from '../handlers/tool.handler.js';
 import { verifyS2sHeader, S2S_HEADER } from '../s2s-verify.js';
 import { timingSafeEqual } from 'node:crypto';
+import express from 'express';
+import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from '@modelcontextprotocol/sdk/server/auth/router.js';
+import { createMcpOAuthProvider } from '../oauth/mcp-oauth-provider.js';
+import { createLoginRouter } from '../oauth/login-router.js';
 
 // Conduit service-to-service auth (gateway#377 parity). Non-empty =
 // enforce X-Gateway-S2S on every /mcp request; empty = disabled, behavior
@@ -28,6 +32,70 @@ const S2S_SECRET = process.env.CONDUIT_S2S_SECRET || '';
 // enforce Authorization: Bearer on every /mcp request; empty = disabled,
 // dark-by-default like S2S_SECRET when unset.
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN || '';
+
+// Self-issued OAuth 2.1 gate for clients that can't send a static bearer
+// header — Claude Desktop's connector UI only speaks OAuth (discovery +
+// dynamic client registration + PKCE), not a header field. Both env vars
+// must be set together to enable it; dark-by-default like the gates above
+// when unset. This does NOT replace MCP_AUTH_TOKEN — a request is allowed
+// through if it satisfies either. See src/oauth/mcp-oauth-provider.ts for
+// why this is a small self-issued AS rather than delegating to Entra ID or
+// needing a database.
+const MCP_OAUTH_PASSWORD = process.env.MCP_OAUTH_PASSWORD || '';
+const MCP_OAUTH_SIGNING_SECRET = process.env.MCP_OAUTH_SIGNING_SECRET || '';
+const MCP_PUBLIC_URL =
+  process.env.MCP_PUBLIC_URL ||
+  (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : '');
+
+if (Boolean(MCP_OAUTH_PASSWORD) !== Boolean(MCP_OAUTH_SIGNING_SECRET)) {
+  throw new Error('MCP_OAUTH_PASSWORD and MCP_OAUTH_SIGNING_SECRET must be set together (both or neither).');
+}
+
+const OAUTH_ENABLED = Boolean(MCP_OAUTH_PASSWORD && MCP_OAUTH_SIGNING_SECRET);
+
+if (OAUTH_ENABLED && !MCP_PUBLIC_URL) {
+  throw new Error(
+    'MCP_OAUTH_PASSWORD/MCP_OAUTH_SIGNING_SECRET are set but MCP_PUBLIC_URL is not. OAuth discovery ' +
+      'needs the externally-reachable base URL of this server, e.g. https://cipp-mcp-production.up.railway.app.'
+  );
+}
+
+const oauthProvider = OAUTH_ENABLED
+  ? createMcpOAuthProvider({ password: MCP_OAUTH_PASSWORD, signingSecret: MCP_OAUTH_SIGNING_SECRET })
+  : undefined;
+
+const oauthResourceUrl = oauthProvider ? new URL('/mcp', MCP_PUBLIC_URL) : undefined;
+
+const oauthResourceMetadataUrl = oauthResourceUrl
+  ? getOAuthProtectedResourceMetadataUrl(oauthResourceUrl)
+  : undefined;
+
+// Everything the SDK's mcpAuthRouter doesn't own (metadata, /authorize,
+// /token, /register, /revoke) plus our own /login prompt, mounted as a
+// small Express sub-app and dispatched to from the raw node:http handler
+// below — see isOAuthAppPath(). The rest of the server (notably /mcp
+// itself) stays on plain node:http; there's no reason to migrate a
+// stateful streaming endpoint to Express just to gain a login form.
+const oauthApp = oauthProvider
+  ? (() => {
+      const app = express();
+      app.use(
+        mcpAuthRouter({
+          provider: oauthProvider,
+          issuerUrl: new URL(MCP_PUBLIC_URL),
+          resourceServerUrl: oauthResourceUrl,
+          resourceName: 'CIPP MCP Server',
+        })
+      );
+      app.use('/login', createLoginRouter(oauthProvider));
+      return app;
+    })()
+  : undefined;
+
+const OAUTH_APP_EXACT_PATHS = new Set(['/authorize', '/token', '/register', '/revoke', '/login']);
+function isOAuthAppPath(pathname: string): boolean {
+  return pathname.startsWith('/.well-known/') || OAUTH_APP_EXACT_PATHS.has(pathname);
+}
 
 export class CippMcpServer {
   private server: Server;
@@ -165,7 +233,6 @@ Tool categories:
   private async startHttpTransport(): Promise<void> {
     const port = this.envConfig?.transport?.port || 8080;
     const host = this.envConfig?.transport?.host || '0.0.0.0';
-    const isGatewayMode = this.envConfig?.auth?.mode === 'gateway';
 
     this.httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
       const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
@@ -176,160 +243,13 @@ Tool categories:
         return;
       }
 
+      if (oauthApp && isOAuthAppPath(url.pathname)) {
+        oauthApp(req, res);
+        return;
+      }
+
       if (url.pathname === '/mcp') {
-        if (MCP_AUTH_TOKEN) {
-          const authHeader = req.headers['authorization'];
-          const provided = typeof authHeader === 'string' && authHeader.startsWith('Bearer ')
-            ? authHeader.slice(7)
-            : '';
-          const expected = Buffer.from(MCP_AUTH_TOKEN);
-          const providedBuf = Buffer.from(provided);
-          const valid = providedBuf.length === expected.length && timingSafeEqual(providedBuf, expected);
-          if (!valid) {
-            res.writeHead(401, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'Missing or invalid Authorization bearer token.' }));
-            return;
-          }
-        }
-
-        // Conduit service-to-service auth (gateway#377 parity): rejected
-        // BEFORE any credential extraction (OAuth or static key), mirroring
-        // every other ported wrapper (e.g.
-        // containers/sentinelone-mcp/gateway_wrapper.py).
-        if (S2S_SECRET && !verifyS2sHeader(req.headers[S2S_HEADER] as string | undefined, S2S_SECRET)) {
-          res.writeHead(401, { 'Content-Type': 'application/json' });
-          res.end(
-            JSON.stringify({
-              error: 'Missing or invalid X-Gateway-S2S header: this endpoint only accepts requests signed by the gateway.',
-            })
-          );
-          return;
-        }
-
-        if (req.method !== 'POST') {
-          res.writeHead(405, { 'Content-Type': 'application/json' });
-          res.end(
-            JSON.stringify({
-              jsonrpc: '2.0',
-              error: { code: -32000, message: 'Method not allowed' },
-              id: null,
-            })
-          );
-          return;
-        }
-
-        let toolHandler = this.toolHandler;
-        let cippService = this.cippService;
-
-        if (isGatewayMode) {
-          const credentials = parseCredentialsFromHeaders(
-            req.headers as Record<string, string | string[] | undefined>
-          );
-
-          const hasOAuth =
-            !!credentials.tenantId && !!credentials.clientId && !!credentials.clientSecret;
-          const hasStatic = !!credentials.apiKey;
-
-          if (!credentials.baseUrl || (!hasStatic && !hasOAuth)) {
-            this.logger.warn('Gateway mode: Missing required credentials in request headers', {
-              hasBaseUrl: !!credentials.baseUrl,
-              hasApiKey: hasStatic,
-              hasOAuthCreds: hasOAuth,
-            });
-            res.writeHead(401, { 'Content-Type': 'application/json' });
-            res.end(
-              JSON.stringify({
-                error: 'Missing credentials',
-                message:
-                  'Gateway mode requires x-base-url plus either x-api-key or (x-tenant-id + x-client-id + x-client-secret)',
-                required: ['x-base-url', 'x-api-key OR (x-tenant-id + x-client-id + x-client-secret)'],
-              })
-            );
-            return;
-          }
-
-          const requestConfig: McpServerConfig = {
-            name: this.config.name,
-            version: this.config.version,
-            cipp: {
-              baseUrl: credentials.baseUrl,
-              ...(credentials.apiKey !== undefined ? { apiKey: credentials.apiKey } : {}),
-              ...(credentials.tenantId !== undefined ? { tenantId: credentials.tenantId } : {}),
-              ...(credentials.clientId !== undefined ? { clientId: credentials.clientId } : {}),
-              ...(credentials.clientSecret !== undefined ? { clientSecret: credentials.clientSecret } : {}),
-              ...(credentials.tokenScope !== undefined ? { tokenScope: credentials.tokenScope } : {}),
-              ...(credentials.tokenUrl !== undefined ? { tokenUrl: credentials.tokenUrl } : {}),
-            },
-          };
-
-          cippService = new CippService(requestConfig, this.logger);
-          toolHandler = new CippToolHandler(cippService, this.logger);
-        }
-
-        const server = new Server(
-          { name: this.config.name, version: this.config.version },
-          {
-            capabilities: { tools: { listChanged: true } },
-            instructions: this.getServerInstructions(),
-          }
-        );
-
-        server.onerror = (error) => this.logger.error('MCP request server error:', error);
-
-        // Wire up handlers using the (possibly per-request) toolHandler
-        server.setRequestHandler(ListToolsRequestSchema, async () => ({
-          tools: toolHandler.getToolDefinitions(),
-        }));
-
-        server.setRequestHandler(CallToolRequestSchema, async (request) => {
-          this.logger.debug(`Handling tool call: ${request.params.name}`);
-          try {
-            const result = await toolHandler.handleToolCall(
-              request.params.name,
-              (request.params.arguments as Record<string, unknown>) || {}
-            );
-            return { content: result.content, isError: result.isError };
-          } catch (error) {
-            this.logger.error(`Failed to call tool ${request.params.name}:`, error);
-            const message = error instanceof Error ? error.message : 'Unknown error';
-            return {
-              content: [{ type: 'text', text: message }],
-              isError: true,
-            };
-          }
-        });
-
-        toolHandler.setServer(server);
-
-        const transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: undefined,
-          enableJsonResponse: true,
-        });
-
-        res.on('close', () => {
-          transport.close();
-          server.close();
-        });
-
-        server
-          .connect(transport as any)
-          .then(() => {
-            transport.handleRequest(req, res);
-          })
-          .catch((err) => {
-            this.logger.error('MCP transport connect error:', err);
-            if (!res.headersSent) {
-              res.writeHead(500, { 'Content-Type': 'application/json' });
-              res.end(
-                JSON.stringify({
-                  jsonrpc: '2.0',
-                  error: { code: -32603, message: 'Internal error' },
-                  id: null,
-                })
-              );
-            }
-          });
-
+        void this.handleMcpRequest(req, res);
         return;
       }
 
@@ -342,11 +262,201 @@ Tool categories:
         this.logger.info(`CIPP MCP Server listening on http://${host}:${port}/mcp`);
         this.logger.info(`Health check available at http://${host}:${port}/health`);
         this.logger.info(
-          `Authentication mode: ${isGatewayMode ? 'gateway (header-based)' : 'env (environment variables)'}`
+          `Authentication mode: ${this.envConfig?.auth?.mode === 'gateway' ? 'gateway (header-based)' : 'env (environment variables)'}`
+        );
+        this.logger.info(
+          `MCP endpoint auth: static token ${MCP_AUTH_TOKEN ? 'enabled' : 'disabled'}, OAuth ${OAUTH_ENABLED ? 'enabled' : 'disabled'}`
         );
         resolve();
       });
     });
+  }
+
+  /**
+   * Checks whether a request to /mcp carries a valid credential — either the
+   * static MCP_AUTH_TOKEN bearer header, or a valid OAuth access token
+   * issued by our own /token endpoint. Either is sufficient; this is an "or"
+   * gate, not an "and" one, so Claude Code (header) and Claude Desktop
+   * (OAuth) can both reach the same server.
+   */
+  private async isMcpAuthorized(req: IncomingMessage): Promise<boolean> {
+    const authHeader = req.headers['authorization'];
+    const provided =
+      typeof authHeader === 'string' && authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+    if (!provided) return false;
+
+    if (MCP_AUTH_TOKEN) {
+      const expected = Buffer.from(MCP_AUTH_TOKEN);
+      const providedBuf = Buffer.from(provided);
+      if (providedBuf.length === expected.length && timingSafeEqual(providedBuf, expected)) {
+        return true;
+      }
+    }
+
+    if (oauthProvider) {
+      try {
+        await oauthProvider.verifyAccessToken(provided);
+        return true;
+      } catch {
+        // Falls through to the `return false` below.
+      }
+    }
+
+    return false;
+  }
+
+  private async handleMcpRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const isGatewayMode = this.envConfig?.auth?.mode === 'gateway';
+
+    if (MCP_AUTH_TOKEN || oauthProvider) {
+      if (!(await this.isMcpAuthorized(req))) {
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (oauthResourceMetadataUrl) {
+          headers['WWW-Authenticate'] = `Bearer resource_metadata="${oauthResourceMetadataUrl}"`;
+        }
+        res.writeHead(401, headers);
+        res.end(JSON.stringify({ error: 'Missing or invalid Authorization bearer token.' }));
+        return;
+      }
+    }
+
+    // Conduit service-to-service auth (gateway#377 parity): rejected
+    // BEFORE any credential extraction (OAuth or static key), mirroring
+    // every other ported wrapper (e.g.
+    // containers/sentinelone-mcp/gateway_wrapper.py).
+    if (S2S_SECRET && !verifyS2sHeader(req.headers[S2S_HEADER] as string | undefined, S2S_SECRET)) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          error: 'Missing or invalid X-Gateway-S2S header: this endpoint only accepts requests signed by the gateway.',
+        })
+      );
+      return;
+    }
+
+    if (req.method !== 'POST') {
+      res.writeHead(405, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          error: { code: -32000, message: 'Method not allowed' },
+          id: null,
+        })
+      );
+      return;
+    }
+
+    let toolHandler = this.toolHandler;
+    let cippService = this.cippService;
+
+    if (isGatewayMode) {
+      const credentials = parseCredentialsFromHeaders(
+        req.headers as Record<string, string | string[] | undefined>
+      );
+
+      const hasOAuth =
+        !!credentials.tenantId && !!credentials.clientId && !!credentials.clientSecret;
+      const hasStatic = !!credentials.apiKey;
+
+      if (!credentials.baseUrl || (!hasStatic && !hasOAuth)) {
+        this.logger.warn('Gateway mode: Missing required credentials in request headers', {
+          hasBaseUrl: !!credentials.baseUrl,
+          hasApiKey: hasStatic,
+          hasOAuthCreds: hasOAuth,
+        });
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            error: 'Missing credentials',
+            message:
+              'Gateway mode requires x-base-url plus either x-api-key or (x-tenant-id + x-client-id + x-client-secret)',
+            required: ['x-base-url', 'x-api-key OR (x-tenant-id + x-client-id + x-client-secret)'],
+          })
+        );
+        return;
+      }
+
+      const requestConfig: McpServerConfig = {
+        name: this.config.name,
+        version: this.config.version,
+        cipp: {
+          baseUrl: credentials.baseUrl,
+          ...(credentials.apiKey !== undefined ? { apiKey: credentials.apiKey } : {}),
+          ...(credentials.tenantId !== undefined ? { tenantId: credentials.tenantId } : {}),
+          ...(credentials.clientId !== undefined ? { clientId: credentials.clientId } : {}),
+          ...(credentials.clientSecret !== undefined ? { clientSecret: credentials.clientSecret } : {}),
+          ...(credentials.tokenScope !== undefined ? { tokenScope: credentials.tokenScope } : {}),
+          ...(credentials.tokenUrl !== undefined ? { tokenUrl: credentials.tokenUrl } : {}),
+        },
+      };
+
+      cippService = new CippService(requestConfig, this.logger);
+      toolHandler = new CippToolHandler(cippService, this.logger);
+    }
+
+    const server = new Server(
+      { name: this.config.name, version: this.config.version },
+      {
+        capabilities: { tools: { listChanged: true } },
+        instructions: this.getServerInstructions(),
+      }
+    );
+
+    server.onerror = (error) => this.logger.error('MCP request server error:', error);
+
+    // Wire up handlers using the (possibly per-request) toolHandler
+    server.setRequestHandler(ListToolsRequestSchema, async () => ({
+      tools: toolHandler.getToolDefinitions(),
+    }));
+
+    server.setRequestHandler(CallToolRequestSchema, async (request) => {
+      this.logger.debug(`Handling tool call: ${request.params.name}`);
+      try {
+        const result = await toolHandler.handleToolCall(
+          request.params.name,
+          (request.params.arguments as Record<string, unknown>) || {}
+        );
+        return { content: result.content, isError: result.isError };
+      } catch (error) {
+        this.logger.error(`Failed to call tool ${request.params.name}:`, error);
+        const message = error instanceof Error ? error.message : 'Unknown error';
+        return {
+          content: [{ type: 'text', text: message }],
+          isError: true,
+        };
+      }
+    });
+
+    toolHandler.setServer(server);
+
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined,
+      enableJsonResponse: true,
+    });
+
+    res.on('close', () => {
+      transport.close();
+      server.close();
+    });
+
+    server
+      .connect(transport as any)
+      .then(() => {
+        transport.handleRequest(req, res);
+      })
+      .catch((err) => {
+        this.logger.error('MCP transport connect error:', err);
+        if (!res.headersSent) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              jsonrpc: '2.0',
+              error: { code: -32603, message: 'Internal error' },
+              id: null,
+            })
+          );
+        }
+      });
   }
 
   /**
