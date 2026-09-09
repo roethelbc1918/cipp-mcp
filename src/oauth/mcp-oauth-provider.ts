@@ -113,6 +113,13 @@ export type LoginResult = { redirectUrl: string } | { error: string };
 export interface McpOAuthProvider extends OAuthServerProvider {
   getLoginTicket(ticketId: string): PendingAuth | undefined;
   submitLogin(ticketId: string, password: string): LoginResult;
+  /**
+   * Completes a pending login without a password check, for callers that
+   * already authenticated the human some other way (e.g. an Entra ID
+   * sign-in plus allowlist check) and just need the ticket turned into an
+   * authorization code.
+   */
+  completeLogin(ticketId: string): LoginResult;
 }
 
 export function createMcpOAuthProvider(options: { password: string; signingSecret: string }): McpOAuthProvider {
@@ -145,6 +152,21 @@ export function createMcpOAuthProvider(options: { password: string; signingSecre
       expires_in: ACCESS_TOKEN_TTL_SECONDS,
       refresh_token: refreshToken,
     };
+  }
+
+  function mintAuthorizationCode(pending: PendingAuth): LoginResult {
+    const code = base64url(randomBytes(32));
+    authCodes.set(code, {
+      clientId: pending.client.client_id,
+      codeChallenge: pending.params.codeChallenge,
+      redirectUri: pending.params.redirectUri,
+      expiresAt: Date.now() + AUTH_CODE_TTL_MS,
+    });
+
+    const redirectUrl = new URL(pending.params.redirectUri);
+    redirectUrl.searchParams.set('code', code);
+    if (pending.params.state !== undefined) redirectUrl.searchParams.set('state', pending.params.state);
+    return { redirectUrl: redirectUrl.href };
   }
 
   const clientsStore: OAuthRegisteredClientsStore = {
@@ -216,18 +238,17 @@ export function createMcpOAuthProvider(options: { password: string; signingSecre
       }
 
       pendingAuth.delete(ticketId);
-      const code = base64url(randomBytes(32));
-      authCodes.set(code, {
-        clientId: pending.client.client_id,
-        codeChallenge: pending.params.codeChallenge,
-        redirectUri: pending.params.redirectUri,
-        expiresAt: Date.now() + AUTH_CODE_TTL_MS,
-      });
+      return mintAuthorizationCode(pending);
+    },
 
-      const redirectUrl = new URL(pending.params.redirectUri);
-      redirectUrl.searchParams.set('code', code);
-      if (pending.params.state !== undefined) redirectUrl.searchParams.set('state', pending.params.state);
-      return { redirectUrl: redirectUrl.href };
+    completeLogin(ticketId: string): LoginResult {
+      sweepExpired();
+      const pending = pendingAuth.get(ticketId);
+      if (!pending) {
+        return { error: 'This login link has expired. Go back to Claude and try connecting again.' };
+      }
+      pendingAuth.delete(ticketId);
+      return mintAuthorizationCode(pending);
     },
 
     async challengeForAuthorizationCode(client: OAuthClientInformationFull, authorizationCode: string): Promise<string> {

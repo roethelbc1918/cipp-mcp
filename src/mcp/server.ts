@@ -11,7 +11,7 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import { CippService } from '../services/cipp.service.js';
-import { Logger } from '../utils/logger.js';
+import { Logger, LogLevel, LogFormat } from '../utils/logger.js';
 import { McpServerConfig } from '../types/index.js';
 import { EnvironmentConfig, parseCredentialsFromHeaders } from '../utils/config.js';
 import { CippToolHandler } from '../handlers/tool.handler.js';
@@ -21,6 +21,8 @@ import express from 'express';
 import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from '@modelcontextprotocol/sdk/server/auth/router.js';
 import { createMcpOAuthProvider } from '../oauth/mcp-oauth-provider.js';
 import { createLoginRouter } from '../oauth/login-router.js';
+import { createEntraLoginRouterPair } from '../oauth/entra-login-router.js';
+import type { EntraConfig } from '../oauth/entra.js';
 
 // Conduit service-to-service auth (gateway#377 parity). Non-empty =
 // enforce X-Gateway-S2S on every /mcp request; empty = disabled, behavior
@@ -35,28 +37,64 @@ const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN || '';
 
 // Self-issued OAuth 2.1 gate for clients that can't send a static bearer
 // header — Claude Desktop's connector UI only speaks OAuth (discovery +
-// dynamic client registration + PKCE), not a header field. Both env vars
-// must be set together to enable it; dark-by-default like the gates above
-// when unset. This does NOT replace MCP_AUTH_TOKEN — a request is allowed
-// through if it satisfies either. See src/oauth/mcp-oauth-provider.ts for
-// why this is a small self-issued AS rather than delegating to Entra ID or
-// needing a database.
+// dynamic client registration + PKCE), not a header field. This does NOT
+// replace MCP_AUTH_TOKEN — a request is allowed through if it satisfies
+// either. See src/oauth/mcp-oauth-provider.ts for why this is a small
+// self-issued AS rather than a full delegation to an external IdP, and
+// needs no database.
+//
+// The AS is the same either way; only who's allowed to complete /login
+// differs, chosen by which env vars are set:
+//   - MCP_OAUTH_PASSWORD: anyone who knows the password (single-user/small
+//     deployments — see src/oauth/login-router.ts).
+//   - MCP_OAUTH_ENTRA_*: anyone who signs in with Microsoft AND is on
+//     MCP_OAUTH_ALLOWED_UPNS (multi-user — each person authenticates as
+//     themselves, with the tenant's own MFA/Conditional Access, rather than
+//     sharing one password). See src/oauth/entra-login-router.ts.
+// If both are configured, Entra takes priority and the password is unused.
 const MCP_OAUTH_PASSWORD = process.env.MCP_OAUTH_PASSWORD || '';
 const MCP_OAUTH_SIGNING_SECRET = process.env.MCP_OAUTH_SIGNING_SECRET || '';
 const MCP_PUBLIC_URL =
   process.env.MCP_PUBLIC_URL ||
   (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : '');
 
-if (Boolean(MCP_OAUTH_PASSWORD) !== Boolean(MCP_OAUTH_SIGNING_SECRET)) {
-  throw new Error('MCP_OAUTH_PASSWORD and MCP_OAUTH_SIGNING_SECRET must be set together (both or neither).');
+const MCP_OAUTH_ENTRA_TENANT_ID = process.env.MCP_OAUTH_ENTRA_TENANT_ID || '';
+const MCP_OAUTH_ENTRA_CLIENT_ID = process.env.MCP_OAUTH_ENTRA_CLIENT_ID || '';
+const MCP_OAUTH_ENTRA_CLIENT_SECRET = process.env.MCP_OAUTH_ENTRA_CLIENT_SECRET || '';
+const MCP_OAUTH_ALLOWED_UPNS = (process.env.MCP_OAUTH_ALLOWED_UPNS || '')
+  .split(',')
+  .map((upn) => upn.trim().toLowerCase())
+  .filter(Boolean);
+
+const entraVarsSet = [MCP_OAUTH_ENTRA_TENANT_ID, MCP_OAUTH_ENTRA_CLIENT_ID, MCP_OAUTH_ENTRA_CLIENT_SECRET];
+if (entraVarsSet.some(Boolean) && !entraVarsSet.every(Boolean)) {
+  throw new Error(
+    'MCP_OAUTH_ENTRA_TENANT_ID, MCP_OAUTH_ENTRA_CLIENT_ID, and MCP_OAUTH_ENTRA_CLIENT_SECRET must be set together (all or none).'
+  );
 }
 
-const OAUTH_ENABLED = Boolean(MCP_OAUTH_PASSWORD && MCP_OAUTH_SIGNING_SECRET);
+const ENTRA_ENABLED = entraVarsSet.every(Boolean);
+
+if (ENTRA_ENABLED && MCP_OAUTH_ALLOWED_UPNS.length === 0) {
+  throw new Error(
+    'MCP_OAUTH_ENTRA_* is configured but MCP_OAUTH_ALLOWED_UPNS is empty — refusing to start with a login that would ' +
+      'let anyone in the Entra tenant in. Set MCP_OAUTH_ALLOWED_UPNS to a comma-separated list of allowed UPNs/emails.'
+  );
+}
+
+const OAUTH_ENABLED = ENTRA_ENABLED || Boolean(MCP_OAUTH_PASSWORD);
+
+if (OAUTH_ENABLED && !MCP_OAUTH_SIGNING_SECRET) {
+  throw new Error(
+    'MCP_OAUTH_PASSWORD or MCP_OAUTH_ENTRA_* is set but MCP_OAUTH_SIGNING_SECRET is not. It signs every client ' +
+      'registration and issued token for the OAuth flow and is required whenever OAuth login is enabled.'
+  );
+}
 
 if (OAUTH_ENABLED && !MCP_PUBLIC_URL) {
   throw new Error(
-    'MCP_OAUTH_PASSWORD/MCP_OAUTH_SIGNING_SECRET are set but MCP_PUBLIC_URL is not. OAuth discovery ' +
-      'needs the externally-reachable base URL of this server, e.g. https://cipp-mcp-production.up.railway.app.'
+    'OAuth login is configured but MCP_PUBLIC_URL is not. OAuth discovery needs the externally-reachable base URL ' +
+      'of this server, e.g. https://cipp-mcp-production.up.railway.app.'
   );
 }
 
@@ -70,12 +108,22 @@ const oauthResourceMetadataUrl = oauthResourceUrl
   ? getOAuthProtectedResourceMetadataUrl(oauthResourceUrl)
   : undefined;
 
+const entraConfig: EntraConfig | undefined = ENTRA_ENABLED
+  ? {
+      tenantId: MCP_OAUTH_ENTRA_TENANT_ID,
+      clientId: MCP_OAUTH_ENTRA_CLIENT_ID,
+      clientSecret: MCP_OAUTH_ENTRA_CLIENT_SECRET,
+      publicUrl: MCP_PUBLIC_URL,
+    }
+  : undefined;
+
 // Everything the SDK's mcpAuthRouter doesn't own (metadata, /authorize,
-// /token, /register, /revoke) plus our own /login prompt, mounted as a
-// small Express sub-app and dispatched to from the raw node:http handler
-// below — see isOAuthAppPath(). The rest of the server (notably /mcp
-// itself) stays on plain node:http; there's no reason to migrate a
-// stateful streaming endpoint to Express just to gain a login form.
+// /token, /register, /revoke) plus the login step (password form, or a
+// hand-off to Microsoft when Entra is configured), mounted as a small
+// Express sub-app and dispatched to from the raw node:http handler below —
+// see isOAuthAppPath(). The rest of the server (notably /mcp itself) stays
+// on plain node:http; there's no reason to migrate a stateful streaming
+// endpoint to Express just to gain a login form.
 const oauthApp = oauthProvider
   ? (() => {
       const app = express();
@@ -87,12 +135,27 @@ const oauthApp = oauthProvider
           resourceName: 'CIPP MCP Server',
         })
       );
-      app.use('/login', createLoginRouter(oauthProvider));
+      if (entraConfig) {
+        const entraLogger = new Logger(
+          (process.env.LOG_LEVEL as LogLevel) || 'info',
+          (process.env.LOG_FORMAT as LogFormat) || 'simple'
+        );
+        const { loginRouter, callbackRouter } = createEntraLoginRouterPair(
+          oauthProvider,
+          entraConfig,
+          new Set(MCP_OAUTH_ALLOWED_UPNS),
+          entraLogger
+        );
+        app.use(loginRouter);
+        app.use('/oauth/entra', callbackRouter);
+      } else {
+        app.use('/login', createLoginRouter(oauthProvider));
+      }
       return app;
     })()
   : undefined;
 
-const OAUTH_APP_EXACT_PATHS = new Set(['/authorize', '/token', '/register', '/revoke', '/login']);
+const OAUTH_APP_EXACT_PATHS = new Set(['/authorize', '/token', '/register', '/revoke', '/login', '/oauth/entra/callback']);
 function isOAuthAppPath(pathname: string): boolean {
   return pathname.startsWith('/.well-known/') || OAUTH_APP_EXACT_PATHS.has(pathname);
 }
@@ -264,8 +327,9 @@ Tool categories:
         this.logger.info(
           `Authentication mode: ${this.envConfig?.auth?.mode === 'gateway' ? 'gateway (header-based)' : 'env (environment variables)'}`
         );
+        const oauthMode = !OAUTH_ENABLED ? 'disabled' : ENTRA_ENABLED ? 'entra' : 'password';
         this.logger.info(
-          `MCP endpoint auth: static token ${MCP_AUTH_TOKEN ? 'enabled' : 'disabled'}, OAuth ${OAUTH_ENABLED ? 'enabled' : 'disabled'}`
+          `MCP endpoint auth: static token ${MCP_AUTH_TOKEN ? 'enabled' : 'disabled'}, OAuth ${oauthMode}`
         );
         resolve();
       });
