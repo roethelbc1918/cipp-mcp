@@ -458,6 +458,26 @@ function summariseMailboxUsage(rows: MailboxUsageRow[]): {
   };
 }
 
+/**
+ * `urlName` values `compareIntunePolicies` accepts, matching the keys of
+ * `Invoke-ExecCompareIntunePolicy`'s `$URLNameToTemplateType` map — the set
+ * of Intune policy families CIPP can resolve a `tenantPolicy` source from.
+ */
+const INTUNE_COMPARE_URL_NAMES = [
+  'DeviceConfigurations',
+  'ConfigurationPolicies',
+  'GroupPolicyConfigurations',
+  'deviceCompliancePolicies',
+  'WindowsDriverUpdateProfiles',
+  'WindowsFeatureUpdateProfiles',
+  'windowsQualityUpdatePolicies',
+  'windowsQualityUpdateProfiles',
+  'hardwareConfigurations',
+  'Intents',
+  'ManagedAppPolicies',
+] as const;
+export type IntuneCompareUrlName = (typeof INTUNE_COMPARE_URL_NAMES)[number];
+
 // ---------------------------------------------------------------------------
 // Service
 // ---------------------------------------------------------------------------
@@ -1503,6 +1523,97 @@ export class CippService {
    */
   async listNamedLocations<T = unknown>(tenantFilter: string): Promise<T> {
     return this.request<T>('GET', 'ListNamedLocations', { tenantFilter });
+  }
+
+  // -------------------------------------------------------------------------
+  // Endpoint Manager / Intune
+  // -------------------------------------------------------------------------
+
+  /**
+   * List every Intune policy in a tenant, all families merged into one
+   * array: device configurations, Settings Catalog, ADMX/Group Policy
+   * configurations, Windows driver/feature/quality update profiles, BIOS
+   * configs, mobile app configs, intents, app protection, and compliance
+   * policies. Each row carries `PolicyTypeName` (a human-readable family
+   * label) and `URLName` (the Graph endpoint segment it came from).
+   * Calls the `ListIntunePolicy` Azure Function.
+   *
+   * @param tenantFilter - Tenant domain or identifier, or `allTenants`.
+   * @param params.useReportDB - Serve from CIPP's cached reporting database
+   *   instead of live Graph. CIPP applies this automatically for
+   *   `allTenants` regardless of this flag.
+   */
+  async listIntunePolicy<T = unknown>(
+    tenantFilter: string,
+    params: { useReportDB?: boolean } = {}
+  ): Promise<T> {
+    return this.request<T>('GET', 'ListIntunePolicy', {
+      tenantFilter,
+      UseReportDB: params.useReportDB,
+    });
+  }
+
+  /**
+   * List Intune device compliance policies for a tenant. Unlike
+   * `listIntunePolicy`, `PolicyTypeName` here is OS-specific (Windows 10/11
+   * Compliance, iOS Compliance, macOS Compliance, Android Compliance,
+   * Android Enterprise/Work Profile Compliance, AOSP Compliance) rather than
+   * a generic policy-family tag.
+   * Calls the `ListCompliancePolicies` Azure Function.
+   *
+   * @param tenantFilter - Tenant domain or identifier, or `allTenants`.
+   * @param params.useReportDB - Serve from CIPP's cached reporting database
+   *   instead of live Graph. CIPP applies this automatically for
+   *   `allTenants` regardless of this flag.
+   */
+  async listIntuneCompliancePolicies<T = unknown>(
+    tenantFilter: string,
+    params: { useReportDB?: boolean } = {}
+  ): Promise<T> {
+    return this.request<T>('GET', 'ListCompliancePolicies', {
+      tenantFilter,
+      UseReportDB: params.useReportDB,
+    });
+  }
+
+  /**
+   * Compare two Intune policies in the same tenant, setting by setting.
+   * Calls the `ExecCompareIntunePolicy` Azure Function with both sides as
+   * `tenantPolicy` sources — CIPP also supports comparing a tenant policy
+   * against a stored template or a community repo file, but this wrapper
+   * only exposes the tenant-vs-tenant case.
+   *
+   * @param tenantFilter - Tenant both policies live in.
+   * @param policyAId - Graph object ID of the first policy.
+   * @param policyAUrlName - Policy family of the first policy. One of
+   *   {@link IntuneCompareUrlName}.
+   * @param policyBId - Graph object ID of the second policy.
+   * @param policyBUrlName - Policy family of the second policy. One of
+   *   {@link IntuneCompareUrlName}.
+   */
+  async compareIntunePolicies<T = unknown>(
+    tenantFilter: string,
+    policyAId: string,
+    policyAUrlName: string,
+    policyBId: string,
+    policyBUrlName: string
+  ): Promise<T> {
+    for (const [label, urlName] of [
+      ['policyAUrlName', policyAUrlName],
+      ['policyBUrlName', policyBUrlName],
+    ] as const) {
+      if (!INTUNE_COMPARE_URL_NAMES.includes(urlName as IntuneCompareUrlName)) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          `${label} must be one of ${INTUNE_COMPARE_URL_NAMES.join(', ')}; got "${urlName}".`
+        );
+      }
+    }
+
+    return this.request<T>('POST', 'ExecCompareIntunePolicy', undefined, {
+      sourceA: { type: 'tenantPolicy', tenantFilter, policyId: policyAId, urlName: policyAUrlName },
+      sourceB: { type: 'tenantPolicy', tenantFilter, policyId: policyBId, urlName: policyBUrlName },
+    });
   }
 
   // -------------------------------------------------------------------------

@@ -318,6 +318,45 @@ export class CippToolHandler {
         }
 
         // -----------------------------------------------------------------------
+        // Intune
+        // -----------------------------------------------------------------------
+        case 'cipp_list_intune_policies': {
+          const { tenantFilter, useReportDB } = args as {
+            tenantFilter: string;
+            useReportDB?: boolean;
+          };
+          result = await this.cippService.listIntunePolicy(tenantFilter, { useReportDB });
+          break;
+        }
+
+        case 'cipp_list_intune_compliance_policies': {
+          const { tenantFilter, useReportDB } = args as {
+            tenantFilter: string;
+            useReportDB?: boolean;
+          };
+          result = await this.cippService.listIntuneCompliancePolicies(tenantFilter, { useReportDB });
+          break;
+        }
+
+        case 'cipp_compare_intune_policies': {
+          const { tenantFilter, policyAId, policyAUrlName, policyBId, policyBUrlName } = args as {
+            tenantFilter: string;
+            policyAId: string;
+            policyAUrlName: string;
+            policyBId: string;
+            policyBUrlName: string;
+          };
+          result = await this.cippService.compareIntunePolicies(
+            tenantFilter,
+            policyAId,
+            policyAUrlName,
+            policyBId,
+            policyBUrlName
+          );
+          break;
+        }
+
+        // -----------------------------------------------------------------------
         // Applications
         // -----------------------------------------------------------------------
         case 'cipp_list_enterprise_apps': {

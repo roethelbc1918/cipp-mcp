@@ -807,6 +807,127 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
   },
 
   // -------------------------------------------------------------------------
+  // Intune tools
+  // -------------------------------------------------------------------------
+  {
+    name: 'cipp_list_intune_policies',
+    description:
+      'List every Intune policy in a tenant, all families merged into one array: device ' +
+      'configurations, Settings Catalog, ADMX/Group Policy configurations, Windows driver/' +
+      'feature/quality update profiles, BIOS configs, mobile app configs, intents, app ' +
+      'protection, and compliance policies. Each row carries PolicyTypeName (a human-readable ' +
+      'family label) and URLName (the policy family, usable as urlName in ' +
+      'cipp_compare_intune_policies). For compliance-policy detail with OS-specific type ' +
+      'labels, use cipp_list_intune_compliance_policies instead.',
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tenantFilter: TENANT_FILTER_PROP,
+        useReportDB: {
+          type: 'boolean',
+          description:
+            "Serve from CIPP's cached reporting database instead of live Graph. Applied " +
+            "automatically when tenantFilter is 'allTenants' regardless of this flag.",
+        },
+      },
+      required: ['tenantFilter'],
+    },
+  },
+  {
+    name: 'cipp_list_intune_compliance_policies',
+    description:
+      'List Intune device compliance policies for a tenant. Unlike cipp_list_intune_policies, ' +
+      'PolicyTypeName here is OS-specific (Windows 10/11 Compliance, iOS Compliance, macOS ' +
+      'Compliance, Android Compliance, Android Enterprise/Work Profile Compliance, AOSP ' +
+      'Compliance) rather than a generic policy-family tag.',
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tenantFilter: TENANT_FILTER_PROP,
+        useReportDB: {
+          type: 'boolean',
+          description:
+            "Serve from CIPP's cached reporting database instead of live Graph. Applied " +
+            "automatically when tenantFilter is 'allTenants' regardless of this flag.",
+        },
+      },
+      required: ['tenantFilter'],
+    },
+  },
+  {
+    name: 'cipp_compare_intune_policies',
+    description:
+      'Compare two Intune policies in the same tenant, setting by setting. Returns identical ' +
+      '(true when there are no differences) and Results (the array of differing settings). ' +
+      'Get policy IDs and urlName values from cipp_list_intune_policies (URLName field) or ' +
+      'cipp_list_intune_compliance_policies first.',
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tenantFilter: {
+          type: 'string',
+          description: 'Tenant domain or ID both policies live in.',
+        },
+        policyAId: {
+          type: 'string',
+          description: 'Graph object ID of the first policy.',
+        },
+        policyAUrlName: {
+          type: 'string',
+          description: 'Policy family of the first policy.',
+          enum: [
+            'DeviceConfigurations',
+            'ConfigurationPolicies',
+            'GroupPolicyConfigurations',
+            'deviceCompliancePolicies',
+            'WindowsDriverUpdateProfiles',
+            'WindowsFeatureUpdateProfiles',
+            'windowsQualityUpdatePolicies',
+            'windowsQualityUpdateProfiles',
+            'hardwareConfigurations',
+            'Intents',
+            'ManagedAppPolicies',
+          ],
+        },
+        policyBId: {
+          type: 'string',
+          description: 'Graph object ID of the second policy.',
+        },
+        policyBUrlName: {
+          type: 'string',
+          description: 'Policy family of the second policy.',
+          enum: [
+            'DeviceConfigurations',
+            'ConfigurationPolicies',
+            'GroupPolicyConfigurations',
+            'deviceCompliancePolicies',
+            'WindowsDriverUpdateProfiles',
+            'WindowsFeatureUpdateProfiles',
+            'windowsQualityUpdatePolicies',
+            'windowsQualityUpdateProfiles',
+            'hardwareConfigurations',
+            'Intents',
+            'ManagedAppPolicies',
+          ],
+        },
+      },
+      required: ['tenantFilter', 'policyAId', 'policyAUrlName', 'policyBId', 'policyBUrlName'],
+    },
+  },
+
+  // -------------------------------------------------------------------------
   // Applications tools
   // -------------------------------------------------------------------------
   {
@@ -1179,6 +1300,11 @@ export const TOOL_CATEGORIES: Record<string, string[]> = {
     'cipp_set_email_forwarding',
   ],
   security: ['cipp_list_conditional_access_policies', 'cipp_list_named_locations'],
+  intune: [
+    'cipp_list_intune_policies',
+    'cipp_list_intune_compliance_policies',
+    'cipp_compare_intune_policies',
+  ],
   applications: ['cipp_list_enterprise_apps'],
   standards: [
     'cipp_list_standards',
