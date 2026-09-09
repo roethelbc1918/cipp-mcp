@@ -16,12 +16,18 @@ import { McpServerConfig } from '../types/index.js';
 import { EnvironmentConfig, parseCredentialsFromHeaders } from '../utils/config.js';
 import { CippToolHandler } from '../handlers/tool.handler.js';
 import { verifyS2sHeader, S2S_HEADER } from '../s2s-verify.js';
+import { timingSafeEqual } from 'node:crypto';
 
 // Conduit service-to-service auth (gateway#377 parity). Non-empty =
 // enforce X-Gateway-S2S on every /mcp request; empty = disabled, behavior
 // exactly as before (dark-by-default until the gateway provisions this
 // container's derived subkey). See src/s2s-verify.ts.
 const S2S_SECRET = process.env.CONDUIT_S2S_SECRET || '';
+
+// Static bearer-token gate for single-tenant/env-mode deployments. Non-empty =
+// enforce Authorization: Bearer on every /mcp request; empty = disabled,
+// dark-by-default like S2S_SECRET when unset.
+const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN || '';
 
 export class CippMcpServer {
   private server: Server;
@@ -171,6 +177,21 @@ Tool categories:
       }
 
       if (url.pathname === '/mcp') {
+        if (MCP_AUTH_TOKEN) {
+          const authHeader = req.headers['authorization'];
+          const provided = typeof authHeader === 'string' && authHeader.startsWith('Bearer ')
+            ? authHeader.slice(7)
+            : '';
+          const expected = Buffer.from(MCP_AUTH_TOKEN);
+          const providedBuf = Buffer.from(provided);
+          const valid = providedBuf.length === expected.length && timingSafeEqual(providedBuf, expected);
+          if (!valid) {
+            res.writeHead(401, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Missing or invalid Authorization bearer token.' }));
+            return;
+          }
+        }
+
         // Conduit service-to-service auth (gateway#377 parity): rejected
         // BEFORE any credential extraction (OAuth or static key), mirroring
         // every other ported wrapper (e.g.
